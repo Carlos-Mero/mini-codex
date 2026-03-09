@@ -9,67 +9,105 @@ Examples and comparisons with the original OpenAI Codex can be found in [mini-co
 
 ## Features
 
-- CLI chat over standard input and output
-- colored terminal labels and a live working indicator while the model is running
-- one tool: `shell`
-- `.env` or environment variable configuration for API access
-- approval mode and auto-approve mode from command-line flags
-- single JSON history file per session under the system temp directory
-- interactive resume flow and `resume --last`
-- streaming model output with retry on API failures
-- agent-loop retry after shell-tool failures by feeding the tool error back to the model
-- folded terminal previews for large tool outputs while keeping the full result in session history
+- simple CLI chat interface
+- built-in `shell` tool for local workspace tasks
+- `.env` and environment variable support for API configuration
+- manual approval mode or `--auto` for tool execution
+- resumable sessions with `resume` and `resume --last`
+- streaming responses with basic retry handling
 - workspace-scoped command validation
 
 ## Configuration
 
-Read from `.env` in the current working directory, then overridden by normal environment variables:
+Configuration is loaded in this order:
+
+1. `.env` in the current working directory
+2. normal environment variables
+
+Environment variables override values from `.env`.
+
+Supported variables:
 
 - `MINI_CODEX_API_KEY` or `OPENAI_API_KEY`
 - `MINI_CODEX_BASE_URL` or `OPENAI_BASE_URL`
 
+### Option 1: use a `.env` file
+
+Create a `.env` file in the directory where you run `mini-codex`:
+
+```env
+OPENAI_API_KEY=your_api_key_here
+OPENAI_BASE_URL=https://api.openai.com/v1
+```
+
+You can also use the `MINI_CODEX_*` names instead:
+
+```env
+MINI_CODEX_API_KEY=your_api_key_here
+MINI_CODEX_BASE_URL=https://api.openai.com/v1
+```
+
+### Option 2: set shell environment variables
+
+For the current shell session:
+
+```bash
+export OPENAI_API_KEY=your_api_key_here
+export OPENAI_BASE_URL=https://api.openai.com/v1
+```
+
+To make them persistent, add them to your shell config file such as `~/.zshrc` or `~/.bashrc`, then reload your shell:
+
+```bash
+source ~/.zshrc
+```
+
+## Install
+
+Install from the current repository:
+
+```bash
+cargo install --path .
+```
+
+Then run:
+
+```bash
+mini-codex
+```
+
+If you update the source and want to reinstall:
+
+```bash
+cargo install --path . --force
+```
+
 ## Run
 
+For local development, run directly with Cargo:
+
 ```bash
-cargo run --manifest-path docs/mini-codex/Cargo.toml
+cargo run -- --model gpt-5.4
 ```
 
-Set the model explicitly:
+Common examples:
 
 ```bash
-cargo run --manifest-path docs/mini-codex/Cargo.toml -- --model gpt-5.4
+cargo run -- --reasoning-effort high
+cargo run -- --auto
+cargo run -- resume
+cargo run -- resume --last
 ```
 
-Set the reasoning effort explicitly:
+### Thinking settings
+
+- `reasoning_effort` is used for OpenAI- and Gemini-family models
+- `enable_thinking` is used for Qwen-, DeepSeek-, and similar model families
+
+Example:
 
 ```bash
-cargo run --manifest-path docs/mini-codex/Cargo.toml -- --reasoning-effort high
-```
-
-`reasoning_effort` is attached for OpenAI- and Gemini-family models. `enable_thinking` is attached for Qwen-, DeepSeek-, and similar model families.
-
-Disable thinking for models that use `enable_thinking` instead of `reasoning_effort`:
-
-```bash
-cargo run --manifest-path docs/mini-codex/Cargo.toml -- --model some-other-model --enable-thinking false
-```
-
-Enable auto approval:
-
-```bash
-cargo run --manifest-path docs/mini-codex/Cargo.toml -- --auto
-```
-
-Resume an earlier session from the current workspace:
-
-```bash
-cargo run --manifest-path docs/mini-codex/Cargo.toml -- resume
-```
-
-Resume the last active session from the current workspace:
-
-```bash
-cargo run --manifest-path docs/mini-codex/Cargo.toml -- resume --last
+cargo run -- --model some-other-model --enable-thinking false
 ```
 
 ## Commands
