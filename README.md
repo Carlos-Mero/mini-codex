@@ -5,6 +5,8 @@
 
 A tiny learning-oriented Codex clone.
 
+Examples and comparisons with the original OpenAI Codex can be found in [mini-codex-examples](https://github.com/Carlos-Mero/mini-codex-examples)
+
 ## Features
 
 - CLI chat over standard input and output
