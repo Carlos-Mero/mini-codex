@@ -42,13 +42,21 @@ pub fn print_tool_result(content: &str, success: bool) {
 }
 
 pub fn print_api_error(message: &str) {
-    println!("{} {}", style(COLOR_RED, "api error>"), fold_for_display(message));
+    println!(
+        "{} {}",
+        style(COLOR_RED, "api error>"),
+        fold_for_display(message)
+    );
 }
 
 pub fn print_tool_call(command: &str, workdir: &str) {
     let prefix = format!("{} ", style(COLOR_CYAN, "tool[shell]>"));
     let message = format!("{command}\n(cwd: {workdir})");
-    println!("{}{}", prefix, fold_lines_for_display(&message, MAX_TOOL_CALL_PREVIEW_LINES));
+    println!(
+        "{}{}",
+        prefix,
+        fold_lines_for_display(&message, MAX_TOOL_CALL_PREVIEW_LINES)
+    );
 }
 
 pub fn prompt_for_approval(auto_approve: &mut bool) -> Result<bool> {

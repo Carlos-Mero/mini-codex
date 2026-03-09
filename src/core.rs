@@ -2,6 +2,7 @@ mod llm;
 mod ui;
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{Local, TimeZone};
 use llm::{LlmConfig, call_model};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -546,13 +547,16 @@ fn load_or_create_session(
 
             println!("available sessions:");
             for (index, session) in sessions.iter().enumerate() {
+                println!("  {}. {}", index + 1, session.history.session_id,);
                 println!(
-                    "  {}. {}  last_active={}  path={}",
-                    index + 1,
-                    session.history.session_id,
-                    session.history.last_active_at_ms,
-                    session.path.display()
+                    "     last active: {}",
+                    format_last_active(session.history.last_active_at_ms)
                 );
+                println!(
+                    "     last prompt: {}",
+                    format_last_user_prompt(&session.history)
+                );
+                println!("     path: {}", session.path.display());
             }
 
             let selected = loop {
@@ -622,6 +626,42 @@ fn sessions_root() -> Result<PathBuf> {
     let root = env::temp_dir().join("mini-codex-sessions");
     fs::create_dir_all(&root).with_context(|| format!("failed to create {}", root.display()))?;
     Ok(root)
+}
+
+fn format_last_active(timestamp_ms: u128) -> String {
+    let timestamp_ms = match i64::try_from(timestamp_ms) {
+        Ok(value) => value,
+        Err(_) => return timestamp_ms.to_string(),
+    };
+    match Local.timestamp_millis_opt(timestamp_ms).single() {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+        None => timestamp_ms.to_string(),
+    }
+}
+
+fn format_last_user_prompt(history: &HistoryFile) -> String {
+    history
+        .entries
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            HistoryEntry::User { content } => Some(preview_text(content, 100)),
+            _ => None,
+        })
+        .unwrap_or_else(|| "(no user prompt yet)".to_string())
+}
+
+fn preview_text(text: &str, max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview = compact.chars().take(max_chars).collect::<String>();
+    if compact.chars().count() > max_chars {
+        preview.push('…');
+    }
+    if preview.is_empty() {
+        "(empty)".to_string()
+    } else {
+        preview
+    }
 }
 
 fn now_millis() -> u128 {

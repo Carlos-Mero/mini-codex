@@ -16,7 +16,11 @@ pub(crate) struct LlmConfig {
     pub(crate) enable_thinking: bool,
 }
 
-pub(crate) fn call_model(client: &Client, config: &LlmConfig, messages: Vec<Value>) -> Result<String> {
+pub(crate) fn call_model(
+    client: &Client,
+    config: &LlmConfig,
+    messages: Vec<Value>,
+) -> Result<String> {
     let body = build_request_body(config, messages);
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     let mut last_error = None;
@@ -97,7 +101,11 @@ fn apply_model_specific_parameters(
 fn model_family(model: &str) -> &str {
     let normalized = model.trim().to_ascii_lowercase();
 
-    if normalized.starts_with("gpt") || normalized.starts_with("o1") || normalized.starts_with("o3") || normalized.starts_with("o4") {
+    if normalized.starts_with("gpt")
+        || normalized.starts_with("o1")
+        || normalized.starts_with("o3")
+        || normalized.starts_with("o4")
+    {
         "openai"
     } else if normalized.starts_with("gemini") {
         "gemini"
