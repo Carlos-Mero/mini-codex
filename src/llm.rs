@@ -19,15 +19,24 @@ pub(crate) struct LlmConfig {
 #[derive(Debug)]
 pub(crate) struct LlmReply {
     pub(crate) content: String,
+    pub(crate) tool_calls: Vec<ToolCall>,
     pub(crate) input_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ToolCall {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) arguments: String,
 }
 
 pub(crate) fn call_model(
     client: &Client,
     config: &LlmConfig,
     messages: Vec<Value>,
+    enable_tools: bool,
 ) -> Result<LlmReply> {
-    let body = build_request_body(config, messages);
+    let body = build_request_body(config, messages, enable_tools);
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     let mut last_error = None;
 
@@ -42,8 +51,15 @@ pub(crate) fn call_model(
                 .context("chat completion request failed")?;
             let response = error_for_status(response)?;
             let payload: Value = response.json().context("failed to decode model response")?;
+            let message = extract_message(&payload)?;
+            let content = extract_response_text(message);
+            let tool_calls = extract_tool_calls(message)?;
+            if content.is_empty() && tool_calls.is_empty() {
+                bail!("model returned neither content nor tool calls");
+            }
             Ok(LlmReply {
-                content: extract_response_text(&payload)?,
+                content,
+                tool_calls,
                 input_tokens: extract_input_tokens(&payload),
             })
         })();
@@ -68,12 +84,16 @@ pub(crate) fn call_model(
     Err(last_error.unwrap_or_else(|| anyhow!("chat completion failed")))
 }
 
-fn build_request_body(config: &LlmConfig, messages: Vec<Value>) -> Value {
+fn build_request_body(config: &LlmConfig, messages: Vec<Value>, enable_tools: bool) -> Value {
     let mut body = json!({
         "model": config.model,
         "messages": messages,
         "stream": false
     });
+
+    if enable_tools {
+        body["tools"] = Value::Array(vec![shell_tool_definition()]);
+    }
 
     if let Some(map) = body.as_object_mut() {
         apply_model_specific_parameters(
@@ -85,6 +105,31 @@ fn build_request_body(config: &LlmConfig, messages: Vec<Value>) -> Value {
     }
 
     body
+}
+
+fn shell_tool_definition() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": "shell_tool",
+            "description": "Run a shell command inside the current workspace. Use this for inspecting files, editing, building, testing, formatting, git inspection, and other local development tasks.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The raw shell command to execute."
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": "Optional relative working directory inside the workspace root."
+                    }
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }
+        }
+    })
 }
 
 fn apply_model_specific_parameters(
@@ -161,14 +206,19 @@ fn error_for_status(response: Response) -> Result<Response> {
     Err(anyhow!("chat completion returned error status: {detail}"))
 }
 
-fn extract_response_text(payload: &Value) -> Result<String> {
-    let content = payload
+fn extract_message(payload: &Value) -> Result<&Value> {
+    payload
         .get("choices")
         .and_then(Value::as_array)
         .and_then(|choices| choices.first())
         .and_then(|choice| choice.get("message"))
-        .and_then(|message| message.get("content"))
-        .ok_or_else(|| anyhow!("model response missing choices[0].message.content"))?;
+        .ok_or_else(|| anyhow!("model response missing choices[0].message"))
+}
+
+fn extract_response_text(message: &Value) -> String {
+    let Some(content) = message.get("content") else {
+        return String::new();
+    };
 
     let text = match content {
         Value::String(text) => text.clone(),
@@ -184,11 +234,44 @@ fn extract_response_text(payload: &Value) -> Result<String> {
         _ => String::new(),
     };
 
-    let text = text.trim().to_string();
-    if text.is_empty() {
-        bail!("model returned empty content");
+    text.trim().to_string()
+}
+
+fn extract_tool_calls(message: &Value) -> Result<Vec<ToolCall>> {
+    let Some(tool_calls) = message.get("tool_calls") else {
+        return Ok(Vec::new());
+    };
+    if tool_calls.is_null() {
+        return Ok(Vec::new());
     }
-    Ok(text)
+    let calls = tool_calls
+        .as_array()
+        .ok_or_else(|| anyhow!("message.tool_calls is not an array"))?;
+
+    let mut parsed = Vec::with_capacity(calls.len());
+    for call in calls {
+        let id = call
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("tool call missing id"))?;
+        let function = call
+            .get("function")
+            .ok_or_else(|| anyhow!("tool call missing function"))?;
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("tool call missing function.name"))?;
+        let arguments = function
+            .get("arguments")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("tool call missing function.arguments"))?;
+        parsed.push(ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        });
+    }
+    Ok(parsed)
 }
 
 fn extract_input_tokens(payload: &Value) -> Option<u64> {

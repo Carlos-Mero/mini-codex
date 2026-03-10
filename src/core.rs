@@ -5,11 +5,12 @@ mod ui;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{Local, TimeZone};
 use history::{
-    CompactionMode, HistoryEntry, HistoryFile, build_messages, normalize_tool_content,
+    AssistantToolCall, CompactionMode, HistoryEntry, HistoryFile, build_messages,
     token_limit_for_model,
 };
-use llm::{LlmConfig, call_model};
+use llm::{LlmConfig, ToolCall, call_model};
 use reqwest::blocking::Client;
+use serde::Deserialize;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -56,23 +57,22 @@ struct ShellRequest {
 }
 
 #[derive(Debug)]
-struct ParsedShellReply {
-    preamble: Option<String>,
-    request: ShellRequest,
-}
-
-#[derive(Debug)]
 struct CommandOutcome {
-    command: String,
-    workdir: String,
     success: bool,
-    content: String,
+    tool_content: String,
 }
 
 #[derive(Debug)]
 struct SessionSummary {
     path: PathBuf,
     history: HistoryFile,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShellToolArgs {
+    command: String,
+    #[serde(default)]
+    workdir: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -271,35 +271,35 @@ impl App {
         for _ in 0..LOOP_LIMIT {
             self.compact_history_if_needed(CompactionMode::MidTurn)?;
             let messages = build_messages(&self.config.workspace_root, &self.history.entries);
-            let reply = call_model(&self.client, &self.config.llm, messages)?;
+            let reply = call_model(&self.client, &self.config.llm, messages, true)?;
             self.history.note_api_input_tokens(reply.input_tokens);
-            let shell_reply = parse_shell_reply(&reply.content);
-
-            self.history.push_assistant(reply.content.clone());
+            let assistant_tool_calls = reply
+                .tool_calls
+                .iter()
+                .map(|call| AssistantToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                })
+                .collect();
+            self.history
+                .push_assistant(reply.content.clone(), assistant_tool_calls);
             self.save_history()?;
 
-            if let Some(shell_reply) = shell_reply {
-                if let Some(preamble) = shell_reply.preamble {
-                    println!("{}{}", role_prefix("assistant", COLOR_GREEN), preamble);
-                }
-
-                let outcome = self.run_shell(shell_reply.request)?;
-                print_tool_result(&outcome.content, outcome.success);
-                self.history.push_tool(
-                    outcome.command,
-                    outcome.workdir,
-                    outcome.success,
-                    outcome.content,
+            if !reply.content.trim().is_empty() {
+                println!(
+                    "{}{}",
+                    role_prefix("assistant", COLOR_GREEN),
+                    reply.content.trim()
                 );
+            }
+
+            if !reply.tool_calls.is_empty() {
+                self.handle_tool_calls(reply.tool_calls)?;
                 self.save_history()?;
                 continue;
             }
 
-            println!(
-                "{}{}",
-                role_prefix("assistant", COLOR_GREEN),
-                reply.content.trim()
-            );
             return Ok(());
         }
 
@@ -323,10 +323,34 @@ impl App {
         };
         self.history.push_user(self.history.compaction_prompt(mode));
         let messages = build_messages(&self.config.workspace_root, &self.history.entries);
-        let reply = call_model(&self.client, &self.config.llm, messages)?;
+        let reply = call_model(&self.client, &self.config.llm, messages, false)?;
         self.history.note_api_input_tokens(reply.input_tokens);
         self.history.apply_compaction(reply.content, resume_user);
         self.save_history()
+    }
+
+    fn handle_tool_calls(&mut self, tool_calls: Vec<ToolCall>) -> Result<()> {
+        for tool_call in tool_calls {
+            match tool_call.name.as_str() {
+                "shell_tool" => {
+                    let request = parse_shell_tool_args(&tool_call)?;
+                    let outcome = self.run_shell(request)?;
+                    print_tool_result(
+                        &normalize_tool_content_for_display(&outcome.tool_content),
+                        outcome.success,
+                    );
+                    self.history
+                        .push_tool(tool_call.id, tool_call.name, outcome.tool_content);
+                }
+                other => {
+                    let content = format!("unsupported tool: {other}");
+                    print_tool_result(&content, false);
+                    self.history
+                        .push_tool(tool_call.id, tool_call.name, content);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn run_shell(&mut self, request: ShellRequest) -> Result<CommandOutcome> {
@@ -336,10 +360,13 @@ impl App {
         print_tool_call(&request.command, &workdir_text);
         if !self.auto_approve && !prompt_for_approval(&mut self.auto_approve)? {
             return Ok(CommandOutcome {
-                command: request.command,
-                workdir: workdir_text,
                 success: false,
-                content: "command rejected by user".to_string(),
+                tool_content: format_tool_content(
+                    &request.command,
+                    &workdir.display().to_string(),
+                    false,
+                    "command rejected by user".to_string(),
+                ),
             });
         }
 
@@ -376,10 +403,13 @@ impl App {
         }
 
         Ok(CommandOutcome {
-            command: request.command,
-            workdir: workdir_text,
             success: output.status.success(),
-            content,
+            tool_content: format_tool_content(
+                &request.command,
+                &workdir_text,
+                output.status.success(),
+                content,
+            ),
         })
     }
 
@@ -398,18 +428,15 @@ impl App {
                     println!("{}{}", role_prefix("you", COLOR_BLUE), content);
                 }
                 HistoryEntry::Assistant { content, .. } => {
-                    println!("{}{}", role_prefix("assistant", COLOR_GREEN), content);
+                    if !content.trim().is_empty() {
+                        println!("{}{}", role_prefix("assistant", COLOR_GREEN), content);
+                    }
                 }
-                HistoryEntry::Tool {
-                    command,
-                    workdir,
-                    success,
-                    content,
-                    ..
-                } => {
-                    print_tool_call(command, workdir);
-                    let normalized = normalize_tool_content(content);
-                    print_tool_result(&normalized, *success);
+                HistoryEntry::Tool { content, .. } => {
+                    print_tool_result(
+                        &normalize_tool_content_for_display(content),
+                        tool_content_success(content),
+                    );
                 }
             }
         }
@@ -428,40 +455,61 @@ impl App {
     }
 }
 
-fn parse_shell_reply(reply: &str) -> Option<ParsedShellReply> {
-    let start = reply.find("<shell")?;
-    let rest = &reply[start..];
-    let tag_end = rest.find('>')?;
-    let open_tag = &rest[..=tag_end];
-    let close_start = rest.find("</shell>")?;
-    let command = rest[tag_end + 1..close_start].trim();
+fn parse_shell_tool_args(tool_call: &ToolCall) -> Result<ShellRequest> {
+    let args: ShellToolArgs = serde_json::from_str(&tool_call.arguments).with_context(|| {
+        format!(
+            "failed to decode arguments for tool {}: {}",
+            tool_call.name, tool_call.arguments
+        )
+    })?;
+    let command = args.command.trim().to_string();
     if command.is_empty() {
-        return None;
+        bail!("shell_tool requires a non-empty command");
     }
-
-    let preamble = reply[..start].trim();
-
-    Some(ParsedShellReply {
-        preamble: (!preamble.is_empty()).then(|| preamble.to_string()),
-        request: ShellRequest {
-            command: command.to_string(),
-            workdir: parse_workspace_attr(open_tag),
-        },
+    Ok(ShellRequest {
+        command,
+        workdir: args
+            .workdir
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
     })
 }
 
-fn parse_workspace_attr(open_tag: &str) -> Option<String> {
-    let marker = "workspace=";
-    let start = open_tag.find(marker)? + marker.len();
-    let quote = open_tag[start..].chars().next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
+fn format_tool_content(command: &str, workdir: &str, success: bool, output: String) -> String {
+    format!("command: {command}\nworkdir: {workdir}\nsuccess: {success}\n\n{output}")
+}
+
+fn normalize_tool_content_for_display(content: &str) -> String {
+    let mut lines = content.lines().peekable();
+
+    for prefix in ["command: ", "workdir: ", "success: "] {
+        match lines.peek().copied() {
+            Some(line) if line.starts_with(prefix) => {
+                lines.next();
+            }
+            _ => return content.to_string(),
+        }
     }
 
-    let value = &open_tag[start + 1..];
-    let end = value.find(quote)?;
-    let workspace = value[..end].trim();
-    (!workspace.is_empty()).then(|| workspace.to_string())
+    while matches!(lines.peek(), Some(line) if line.trim().is_empty()) {
+        lines.next();
+    }
+
+    let normalized = lines.collect::<Vec<_>>().join("\n");
+    if normalized.is_empty() {
+        "(no output)".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn tool_content_success(content: &str) -> bool {
+    content
+        .lines()
+        .nth(2)
+        .and_then(|line| line.strip_prefix("success: "))
+        .map(|value| value.trim() == "true")
+        .unwrap_or(false)
 }
 
 fn resolve_workdir(workspace_root: &Path, requested: Option<&str>) -> Result<PathBuf> {
@@ -493,7 +541,7 @@ fn load_or_create_session(
     match resume {
         ResumeMode::New => {
             let history = HistoryFile {
-                version: 2,
+                version: 3,
                 session_id: format!("session-{}-{}", now_millis(), std::process::id()),
                 workspace_root: workspace_root.display().to_string(),
                 last_active_at_ms: now_millis(),

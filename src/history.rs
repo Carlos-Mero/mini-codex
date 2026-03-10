@@ -37,16 +37,26 @@ pub(crate) enum HistoryEntry {
     Assistant {
         content: String,
         #[serde(default)]
+        tool_calls: Vec<AssistantToolCall>,
+        #[serde(default)]
         estimated_tokens: u64,
     },
     Tool {
-        command: String,
-        workdir: String,
-        success: bool,
+        #[serde(default)]
+        tool_call_id: String,
+        #[serde(default)]
+        tool_name: String,
         content: String,
         #[serde(default)]
         estimated_tokens: u64,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AssistantToolCall {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) arguments: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,24 +73,18 @@ impl HistoryFile {
         });
     }
 
-    pub(crate) fn push_assistant(&mut self, content: String) {
+    pub(crate) fn push_assistant(&mut self, content: String, tool_calls: Vec<AssistantToolCall>) {
         self.entries.push(HistoryEntry::Assistant {
             content,
+            tool_calls,
             estimated_tokens: 0,
         });
     }
 
-    pub(crate) fn push_tool(
-        &mut self,
-        command: String,
-        workdir: String,
-        success: bool,
-        content: String,
-    ) {
+    pub(crate) fn push_tool(&mut self, tool_call_id: String, tool_name: String, content: String) {
         self.entries.push(HistoryEntry::Tool {
-            command,
-            workdir,
-            success,
+            tool_call_id,
+            tool_name,
             content,
             estimated_tokens: 0,
         });
@@ -190,7 +194,16 @@ impl HistoryEntry {
         match self {
             Self::System { content, .. }
             | Self::User { content, .. }
-            | Self::Assistant { content, .. } => text_weight(content),
+            | Self::Assistant { content, .. } => {
+                let tool_call_weight = match self {
+                    Self::Assistant { tool_calls, .. } => tool_calls
+                        .iter()
+                        .map(|call| text_weight(&call.name) + text_weight(&call.arguments))
+                        .sum(),
+                    _ => 0,
+                };
+                text_weight(content) + tool_call_weight
+            }
             Self::Tool { content, .. } => text_weight(content),
         }
     }
@@ -235,18 +248,47 @@ pub(crate) fn build_messages(workspace_root: &Path, entries: &[HistoryEntry]) ->
             HistoryEntry::User { content, .. } => {
                 messages.push(json!({"role": "user", "content": content}));
             }
-            HistoryEntry::Assistant { content, .. } => {
-                messages.push(json!({"role": "assistant", "content": content}));
+            HistoryEntry::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => {
+                let assistant_content = if tool_calls.is_empty() || !content.trim().is_empty() {
+                    Value::String(content.clone())
+                } else {
+                    Value::Null
+                };
+                let mut message = json!({"role": "assistant", "content": assistant_content});
+                if !tool_calls.is_empty() {
+                    message["tool_calls"] = Value::Array(
+                        tool_calls
+                            .iter()
+                            .map(|call| {
+                                json!({
+                                    "id": call.id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": call.name,
+                                        "arguments": call.arguments
+                                    }
+                                })
+                            })
+                            .collect(),
+                    );
+                }
+                messages.push(message);
             }
             HistoryEntry::Tool {
-                success, content, ..
+                tool_call_id,
+                tool_name,
+                content,
+                ..
             } => {
-                let content = normalize_tool_content(content);
                 messages.push(json!({
-                    "role": "user",
-                    "content": format!(
-                        "Shell command result:\nsuccess: {success}\n{content}"
-                    )
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "name": tool_name,
+                    "content": content
                 }));
             }
         }
@@ -300,48 +342,19 @@ fn text_weight(text: &str) -> u64 {
     text.split_whitespace().count().max(1) as u64
 }
 
-pub(crate) fn normalize_tool_content(content: &str) -> String {
-    let mut lines = content.lines().peekable();
-
-    for prefix in ["command: ", "workdir: ", "exit_code: "] {
-        match lines.peek().copied() {
-            Some(line) if line.starts_with(prefix) => {
-                lines.next();
-            }
-            _ => return content.to_string(),
-        }
-    }
-
-    while matches!(lines.peek(), Some(line) if line.trim().is_empty()) {
-        lines.next();
-    }
-
-    let normalized = lines.collect::<Vec<_>>().join("\n");
-    if normalized.is_empty() {
-        "(no output)".to_string()
-    } else {
-        normalized
-    }
-}
-
 fn system_prompt(workspace_root: &Path) -> String {
     format!(
         concat!(
             "You are Mini Codex, a coding assistant working inside a local workspace.\n",
             "Workspace root: {}.\n",
             "Keep responses concise and focus on completing the user's request.\n",
-            "Before changing code, prefer inspecting the current state.\n",
+            "Before changing code or answering questions about the local projects, prefer inspecting the current state.\n",
             "Do not use destructive commands unless clearly necessary, and never access anything outside the workspace root.\n",
-            "Use the shell tool whenever inspection, editing, running programs, searching, debugging, building, testing, formatting, git inspection, or other workspace tasks require command-line access.\n",
-            "Treat the shell tool as powerful and potentially dangerous.\n",
+            "Use the available shell_tool whenever inspection, editing, running programs, searching, debugging, building, testing, formatting, git inspection, or other workspace tasks require command-line access.\n",
+            "Treat the shell_tool as powerful and potentially dangerous.\n",
             "If a shell command fails, read the result carefully and continue by trying another valid approach when possible.\n",
-            "When you need shell access, reply with plain text using this exact XML-style format:\n",
-            "<shell>raw shell command</shell>\n",
-            "or, if needed,\n",
-            "<shell workspace=\"./relative/path\">raw shell command</shell>\n",
-            "The workspace attribute is optional and must stay inside the workspace root.\n",
-            "You may include some short preamble before the shell tag, but do not include anything else after it.\n",
-            "Only request one shell command at a time.\n",
+            "When calling shell_tool, the workdir argument is optional and must stay inside the workspace root.\n",
+            "Prefer one shell_tool call at a time unless batching multiple independent read-only commands is clearly useful.\n",
             "If shell access is not needed, answer normally.\n"
         ),
         workspace_root.display()
