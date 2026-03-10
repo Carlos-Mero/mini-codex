@@ -1,12 +1,15 @@
+mod history;
 mod llm;
 mod ui;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{Local, TimeZone};
+use history::{
+    CompactionMode, HistoryEntry, HistoryFile, build_messages, normalize_tool_content,
+    token_limit_for_model,
+};
 use llm::{LlmConfig, call_model};
 use reqwest::blocking::Client;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -26,6 +29,7 @@ const LOOP_LIMIT: usize = 64;
 #[derive(Clone, Debug)]
 struct Config {
     llm: LlmConfig,
+    history_token_limit: u64,
     workspace_root: PathBuf,
 }
 
@@ -43,32 +47,6 @@ enum ResumeMode {
     New,
     Select,
     Last,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct HistoryFile {
-    version: u32,
-    session_id: String,
-    workspace_root: String,
-    last_active_at_ms: u128,
-    entries: Vec<HistoryEntry>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum HistoryEntry {
-    User {
-        content: String,
-    },
-    Assistant {
-        content: String,
-    },
-    Tool {
-        command: String,
-        workdir: String,
-        success: bool,
-        content: String,
-    },
 }
 
 #[derive(Debug)]
@@ -115,6 +93,7 @@ impl App {
         let mut enable_thinking = true;
         let mut auto_approve = false;
         let mut resume = ResumeMode::New;
+        let mut history_token_limit = None;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -135,6 +114,16 @@ impl App {
                         .ok_or_else(|| anyhow!("--enable-thinking requires a value"))?;
                     enable_thinking = parse_bool_flag("--enable-thinking", &value)?;
                 }
+                "--token-limit" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--token-limit requires a value"))?;
+                    history_token_limit = Some(
+                        value
+                            .parse::<u64>()
+                            .with_context(|| format!("invalid --token-limit value: {value}"))?,
+                    );
+                }
                 "resume" => resume = ResumeMode::Select,
                 "--last" => resume = ResumeMode::Last,
                 "--help" | "-h" => {
@@ -149,6 +138,8 @@ impl App {
             .ok_or_else(|| anyhow!("missing MINI_CODEX_API_KEY or OPENAI_API_KEY"))?;
         let base_url = read_env(&["MINI_CODEX_BASE_URL", "OPENAI_BASE_URL"])
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        let resolved_history_token_limit =
+            history_token_limit.unwrap_or_else(|| token_limit_for_model(&model));
         let config = Config {
             llm: LlmConfig {
                 api_key,
@@ -157,6 +148,7 @@ impl App {
                 reasoning_effort,
                 enable_thinking,
             },
+            history_token_limit: resolved_history_token_limit,
             workspace_root: workspace_root.clone(),
         };
         let (history_path, history) = load_or_create_session(&workspace_root, resume)?;
@@ -190,6 +182,11 @@ impl App {
             "{} {}",
             style(COLOR_DIM, "enable thinking:"),
             self.config.llm.enable_thinking
+        );
+        println!(
+            "{} {}",
+            style(COLOR_DIM, "history token limit:"),
+            self.config.history_token_limit
         );
         println!(
             "{} {}",
@@ -267,19 +264,18 @@ impl App {
     }
 
     fn run_turn(&mut self, user_input: String) -> Result<()> {
-        self.history.entries.push(HistoryEntry::User {
-            content: user_input,
-        });
+        self.compact_history_if_needed(CompactionMode::BeforeTurn)?;
+        self.history.push_user(user_input);
         self.save_history()?;
 
         for _ in 0..LOOP_LIMIT {
+            self.compact_history_if_needed(CompactionMode::MidTurn)?;
             let messages = build_messages(&self.config.workspace_root, &self.history.entries);
             let reply = call_model(&self.client, &self.config.llm, messages)?;
-            let shell_reply = parse_shell_reply(&reply);
+            self.history.note_api_input_tokens(reply.input_tokens);
+            let shell_reply = parse_shell_reply(&reply.content);
 
-            self.history.entries.push(HistoryEntry::Assistant {
-                content: reply.clone(),
-            });
+            self.history.push_assistant(reply.content.clone());
             self.save_history()?;
 
             if let Some(shell_reply) = shell_reply {
@@ -289,23 +285,48 @@ impl App {
 
                 let outcome = self.run_shell(shell_reply.request)?;
                 print_tool_result(&outcome.content, outcome.success);
-                self.history.entries.push(HistoryEntry::Tool {
-                    command: outcome.command,
-                    workdir: outcome.workdir,
-                    success: outcome.success,
-                    content: outcome.content,
-                });
+                self.history.push_tool(
+                    outcome.command,
+                    outcome.workdir,
+                    outcome.success,
+                    outcome.content,
+                );
                 self.save_history()?;
                 continue;
             }
 
-            println!("{}{}", role_prefix("assistant", COLOR_GREEN), reply.trim());
+            println!(
+                "{}{}",
+                role_prefix("assistant", COLOR_GREEN),
+                reply.content.trim()
+            );
             return Ok(());
         }
 
         Err(anyhow!(
             "agent loop exceeded {LOOP_LIMIT} steps without producing a final response"
         ))
+    }
+
+    fn compact_history_if_needed(&mut self, mode: CompactionMode) -> Result<()> {
+        if !self
+            .history
+            .needs_compaction(self.config.history_token_limit)
+        {
+            return Ok(());
+        }
+
+        let resume_user = if mode == CompactionMode::MidTurn {
+            self.history.last_user_content()
+        } else {
+            None
+        };
+        self.history.push_user(self.history.compaction_prompt(mode));
+        let messages = build_messages(&self.config.workspace_root, &self.history.entries);
+        let reply = call_model(&self.client, &self.config.llm, messages)?;
+        self.history.note_api_input_tokens(reply.input_tokens);
+        self.history.apply_compaction(reply.content, resume_user);
+        self.save_history()
     }
 
     fn run_shell(&mut self, request: ShellRequest) -> Result<CommandOutcome> {
@@ -335,19 +356,23 @@ impl App {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let mut content = format!(
-            "command: {}\nworkdir: {}\nexit_code: {}\n",
-            request.command,
-            workdir.display(),
-            output.status.code().unwrap_or(-1)
-        );
+        let mut content = String::new();
         if !stdout.trim().is_empty() {
-            content.push_str("\nstdout:\n");
+            content.push_str("stdout:\n");
             content.push_str(stdout.as_ref());
         }
         if !stderr.trim().is_empty() {
-            content.push_str("\nstderr:\n");
+            if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
+            }
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str("stderr:\n");
             content.push_str(stderr.as_ref());
+        }
+        if content.trim().is_empty() {
+            content.push_str("(no output)");
         }
 
         Ok(CommandOutcome {
@@ -366,10 +391,13 @@ impl App {
         println!("{}", style(COLOR_BOLD, "resumed history"));
         for entry in &self.history.entries {
             match entry {
-                HistoryEntry::User { content } => {
+                HistoryEntry::System { content, .. } => {
+                    println!("{}{}", role_prefix("system", COLOR_YELLOW), content);
+                }
+                HistoryEntry::User { content, .. } => {
                     println!("{}{}", role_prefix("you", COLOR_BLUE), content);
                 }
-                HistoryEntry::Assistant { content } => {
+                HistoryEntry::Assistant { content, .. } => {
                     println!("{}{}", role_prefix("assistant", COLOR_GREEN), content);
                 }
                 HistoryEntry::Tool {
@@ -377,9 +405,11 @@ impl App {
                     workdir,
                     success,
                     content,
+                    ..
                 } => {
                     print_tool_call(command, workdir);
-                    print_tool_result(content, *success);
+                    let normalized = normalize_tool_content(content);
+                    print_tool_result(&normalized, *success);
                 }
             }
         }
@@ -396,63 +426,6 @@ impl App {
             )
         })
     }
-}
-
-fn build_messages(workspace_root: &Path, entries: &[HistoryEntry]) -> Vec<Value> {
-    let mut messages = vec![json!({
-        "role": "system",
-        "content": system_prompt(workspace_root)
-    })];
-
-    for entry in entries {
-        match entry {
-            HistoryEntry::User { content } => {
-                messages.push(json!({"role": "user", "content": content}));
-            }
-            HistoryEntry::Assistant { content } => {
-                messages.push(json!({"role": "assistant", "content": content}));
-            }
-            HistoryEntry::Tool {
-                command,
-                workdir,
-                success,
-                content,
-            } => {
-                messages.push(json!({
-                    "role": "user",
-                    "content": format!(
-                        "Shell command result:\ncommand: {command}\nworkdir: {workdir}\nsuccess: {success}\n{content}"
-                    )
-                }));
-            }
-        }
-    }
-
-    messages
-}
-
-fn system_prompt(workspace_root: &Path) -> String {
-    format!(
-        concat!(
-            "You are Mini Codex, a coding assistant working inside a local workspace.\n",
-            "Workspace root: {}.\n",
-            "Keep responses concise and focus on completing the user's request.\n",
-            "Before changing code, prefer inspecting the current state.\n",
-            "Do not use destructive commands unless clearly necessary, and never access anything outside the workspace root.\n",
-            "Use the shell tool whenever inspection, editing, running programs, searching, debugging, building, testing, formatting, git inspection, or other workspace tasks require command-line access.\n",
-            "Treat the shell tool as powerful and potentially dangerous.\n",
-            "If a shell command fails, read the result carefully and continue by trying another valid approach when possible.\n",
-            "When you need shell access, reply with plain text using this exact XML-style format:\n",
-            "<shell>raw shell command</shell>\n",
-            "or, if needed,\n",
-            "<shell workspace=\"./relative/path\">raw shell command</shell>\n",
-            "The workspace attribute is optional and must stay inside the workspace root.\n",
-            "You may include some short preamble before the shell tag, but do not include anything else after it.\n",
-            "Only request one shell command at a time.\n",
-            "If shell access is not needed, answer normally.\n"
-        ),
-        workspace_root.display()
-    )
 }
 
 fn parse_shell_reply(reply: &str) -> Option<ParsedShellReply> {
@@ -520,10 +493,12 @@ fn load_or_create_session(
     match resume {
         ResumeMode::New => {
             let history = HistoryFile {
-                version: 1,
+                version: 2,
                 session_id: format!("session-{}-{}", now_millis(), std::process::id()),
                 workspace_root: workspace_root.display().to_string(),
                 last_active_at_ms: now_millis(),
+                last_api_input_tokens: None,
+                last_accounted_entry_count: 0,
                 entries: Vec::new(),
             };
             Ok((
@@ -645,7 +620,7 @@ fn format_last_user_prompt(history: &HistoryFile) -> String {
         .iter()
         .rev()
         .find_map(|entry| match entry {
-            HistoryEntry::User { content } => Some(preview_text(content, 100)),
+            HistoryEntry::User { content, .. } => Some(preview_text(content, 100)),
             _ => None,
         })
         .unwrap_or_else(|| "(no user prompt yet)".to_string())
@@ -693,9 +668,9 @@ fn print_help() {
     println!();
     println!("{}", style(COLOR_DIM, "usage:"));
     println!(
-        "  mini-codex [--model MODEL] [--reasoning-effort LEVEL] [--enable-thinking BOOL] [--auto]"
+        "  mini-codex [--model MODEL] [--reasoning-effort LEVEL] [--enable-thinking BOOL] [--token-limit TOKENS] [--auto]"
     );
     println!(
-        "  mini-codex resume [--last] [--model MODEL] [--reasoning-effort LEVEL] [--enable-thinking BOOL] [--auto]"
+        "  mini-codex resume [--last] [--model MODEL] [--reasoning-effort LEVEL] [--enable-thinking BOOL] [--token-limit TOKENS] [--auto]"
     );
 }

@@ -16,18 +16,24 @@ pub(crate) struct LlmConfig {
     pub(crate) enable_thinking: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct LlmReply {
+    pub(crate) content: String,
+    pub(crate) input_tokens: Option<u64>,
+}
+
 pub(crate) fn call_model(
     client: &Client,
     config: &LlmConfig,
     messages: Vec<Value>,
-) -> Result<String> {
+) -> Result<LlmReply> {
     let body = build_request_body(config, messages);
     let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
     let mut last_error = None;
 
     for attempt in 1..=API_RETRIES {
         let mut spinner = Spinner::start();
-        let outcome = (|| -> Result<String> {
+        let outcome = (|| -> Result<LlmReply> {
             let response = client
                 .post(&url)
                 .bearer_auth(&config.api_key)
@@ -36,7 +42,10 @@ pub(crate) fn call_model(
                 .context("chat completion request failed")?;
             let response = error_for_status(response)?;
             let payload: Value = response.json().context("failed to decode model response")?;
-            extract_response_text(&payload)
+            Ok(LlmReply {
+                content: extract_response_text(&payload)?,
+                input_tokens: extract_input_tokens(&payload),
+            })
         })();
         spinner.stop();
 
@@ -180,6 +189,17 @@ fn extract_response_text(payload: &Value) -> Result<String> {
         bail!("model returned empty content");
     }
     Ok(text)
+}
+
+fn extract_input_tokens(payload: &Value) -> Option<u64> {
+    payload
+        .get("usage")
+        .and_then(|usage| {
+            usage
+                .get("input_tokens")
+                .or_else(|| usage.get("prompt_tokens"))
+        })
+        .and_then(Value::as_u64)
 }
 
 fn format_api_error(status: StatusCode, body: &str) -> String {
