@@ -112,6 +112,7 @@ cargo run -- --model some-other-model --enable-thinking false
 
 ## Commands
 
+- `/continue` - retry the previous turn from current history without adding a new user message
 - `/help`
 - `/exit`
 - `/auto on`

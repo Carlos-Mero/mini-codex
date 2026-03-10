@@ -237,11 +237,14 @@ impl App {
 
             match line.as_str() {
                 "/exit" | "/quit" => break,
+                "/continue" => {
+                    if let Err(err) = self.continue_turn() {
+                        eprintln!("{} {err:#}", style(COLOR_RED, "error>"));
+                    }
+                    continue;
+                }
                 "/help" => {
-                    println!("{}", style(COLOR_DIM, "/help"));
-                    println!("{}", style(COLOR_DIM, "/exit"));
-                    println!("{}", style(COLOR_DIM, "/auto on"));
-                    println!("{}", style(COLOR_DIM, "/auto off"));
+                    print_repl_help(self.auto_approve, &self.history_path);
                     continue;
                 }
                 "/auto on" => {
@@ -269,7 +272,14 @@ impl App {
         self.compact_history_if_needed(CompactionMode::BeforeTurn)?;
         self.history.push_user(user_input);
         self.save_history()?;
+        self.run_agent_loop()
+    }
 
+    fn continue_turn(&mut self) -> Result<()> {
+        self.run_agent_loop()
+    }
+
+    fn run_agent_loop(&mut self) -> Result<()> {
         for _ in 0..LOOP_LIMIT {
             self.compact_history_if_needed(CompactionMode::MidTurn)?;
             let messages = build_messages(&self.config.workspace_root, &self.history.entries);
@@ -739,4 +749,103 @@ fn print_help() {
     println!(
         "  mini-codex resume [--last] [--model MODEL] [--reasoning-effort LEVEL] [--enable-thinking BOOL] [--token-limit TOKENS] [--auto]"
     );
+    println!();
+    println!("{}", style(COLOR_DIM, "options:"));
+    println!(
+        "  {}  Override the model name",
+        style(COLOR_DIM, "--model MODEL")
+    );
+    println!(
+        "  {}  Set model reasoning effort (commonly low/medium/high)",
+        style(COLOR_DIM, "--reasoning-effort LEVEL")
+    );
+    println!(
+        "  {}  Enable or disable model thinking tokens",
+        style(COLOR_DIM, "--enable-thinking BOOL")
+    );
+    println!(
+        "  {}  Override the session history compaction threshold",
+        style(COLOR_DIM, "--token-limit TOKENS")
+    );
+    println!(
+        "  {}  Auto-approve shell commands instead of asking first",
+        style(COLOR_DIM, "--auto")
+    );
+    println!(
+        "  {}  Resume a previous session for this workspace",
+        style(COLOR_DIM, "resume")
+    );
+    println!(
+        "  {}  Resume the most recent session without prompting",
+        style(COLOR_DIM, "--last")
+    );
+    println!();
+    println!("{}", style(COLOR_DIM, "environment:"));
+    println!(
+        "  {} or {}",
+        style(COLOR_DIM, "MINI_CODEX_API_KEY"),
+        style(COLOR_DIM, "OPENAI_API_KEY")
+    );
+    println!(
+        "  {} or {}",
+        style(COLOR_DIM, "MINI_CODEX_BASE_URL"),
+        style(COLOR_DIM, "OPENAI_BASE_URL")
+    );
+    println!();
+    println!("{}", style(COLOR_DIM, "interactive commands:"));
+    println!(
+        "  {}  Retry the previous turn without adding a new user message",
+        style(COLOR_DIM, "/continue")
+    );
+    println!("  {}  Show in-session help", style(COLOR_DIM, "/help"));
+    println!(
+        "  {}  Enable auto approval for shell commands",
+        style(COLOR_DIM, "/auto on")
+    );
+    println!(
+        "  {}  Require approval before shell commands",
+        style(COLOR_DIM, "/auto off")
+    );
+    println!("  {}  Exit the current session", style(COLOR_DIM, "/exit"));
+    println!("  {}  Exit the current session", style(COLOR_DIM, "/quit"));
+}
+
+fn print_repl_help(auto_approve: bool, history_path: &Path) {
+    println!("{}", style(COLOR_BOLD, "interactive help"));
+    println!();
+    println!("{}", style(COLOR_DIM, "slash commands:"));
+    println!(
+        "  {}  Retry the previous turn without adding a new user message",
+        style(COLOR_DIM, "/continue")
+    );
+    println!("  {}  Show this help", style(COLOR_DIM, "/help"));
+    println!(
+        "  {}  Enable auto approval for shell commands",
+        style(COLOR_DIM, "/auto on")
+    );
+    println!(
+        "  {}  Require approval before shell commands",
+        style(COLOR_DIM, "/auto off")
+    );
+    println!("  {}  Exit the current session", style(COLOR_DIM, "/exit"));
+    println!("  {}  Exit the current session", style(COLOR_DIM, "/quit"));
+    println!();
+    println!("{}", style(COLOR_DIM, "current session:"));
+    println!(
+        "  approval mode: {}",
+        if auto_approve {
+            style(COLOR_YELLOW, "auto")
+        } else {
+            style(COLOR_CYAN, "ask")
+        }
+    );
+    println!("  history file: {}", history_path.display());
+    println!();
+    println!("{}", style(COLOR_DIM, "how to use it:"));
+    println!("  - Type normal requests in plain language.");
+    println!("  - Use /continue to retry the previous turn from the current saved history.");
+    println!("  - The assistant may inspect files, edit code, run tests, and explain results.");
+    println!("  - Shell commands run inside the current workspace only.");
+    println!("  - In ask mode, you can approve or reject each shell command before execution.");
+    println!("  - Ctrl-C cancels the current input line; Ctrl-D exits the session.");
 }
