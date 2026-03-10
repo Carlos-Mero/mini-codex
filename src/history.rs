@@ -437,6 +437,10 @@ fn system_prompt(workspace_root: &Path) -> String {
             "If a shell command fails, read the result carefully and continue by trying another valid approach when possible.\n",
             "When calling shell_tool, the workdir argument is optional and must stay inside the workspace root.\n",
             "Prefer one shell_tool call at a time unless batching multiple independent read-only commands is clearly useful.\n",
+            "Before calling a tool, usually include a brief preamble for the user that says what you are about to do and why.
+",
+            "Keep tool preambles short: typically one sentence and under 20 words.
+",
             "If shell access is not needed, answer normally.\n"
         ),
         workspace_root.display()
