@@ -15,9 +15,11 @@ pub(crate) struct HistoryFile {
     pub(crate) workspace_root: String,
     pub(crate) last_active_at_ms: u128,
     #[serde(default)]
-    pub(crate) last_api_input_tokens: Option<u64>,
+    pub(crate) total_input_tokens: u64,
     #[serde(default)]
-    pub(crate) last_accounted_entry_count: usize,
+    pub(crate) total_output_tokens: u64,
+    #[serde(default)]
+    pub(crate) total_tokens: u64,
     pub(crate) entries: Vec<HistoryEntry>,
 }
 
@@ -97,23 +99,32 @@ impl HistoryFile {
         });
     }
 
-    pub(crate) fn note_api_input_tokens(&mut self, input_tokens: Option<u64>) {
-        let Some(current_input_tokens) = input_tokens else {
-            self.last_accounted_entry_count = self.entries.len();
-            self.last_api_input_tokens = None;
-            return;
-        };
+    pub(crate) fn note_api_usage(
+        &mut self,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        total_tokens: Option<u64>,
+    ) {
+        let start = self.last_system_index().unwrap_or(0);
+        let entry_count = self.entries[start..].len() as u64;
+        let entry_estimate = estimate_entry_tokens(&self.entries, start);
+        self.total_input_tokens = self
+            .total_input_tokens
+            .saturating_add(input_tokens.unwrap_or(0));
+        self.total_output_tokens = self
+            .total_output_tokens
+            .saturating_add(output_tokens.unwrap_or(0));
+        let fallback_total = input_tokens
+            .unwrap_or(0)
+            .saturating_add(output_tokens.unwrap_or(0));
+        self.total_tokens = self
+            .total_tokens
+            .saturating_add(total_tokens.unwrap_or(fallback_total));
 
-        let pending_start = self.last_accounted_entry_count.min(self.entries.len());
-        let pending_entries = &mut self.entries[pending_start..];
-        let delta = match self.last_api_input_tokens {
-            Some(previous) if current_input_tokens >= previous => current_input_tokens - previous,
-            _ => current_input_tokens,
-        };
-
-        distribute_tokens(pending_entries, delta);
-        self.last_accounted_entry_count = self.entries.len();
-        self.last_api_input_tokens = Some(current_input_tokens);
+        let active_estimate = input_tokens
+            .or(total_tokens)
+            .unwrap_or_else(|| entry_estimate.max(entry_count));
+        apply_estimated_tokens(&mut self.entries, start, active_estimate);
     }
 
     pub(crate) fn active_token_usage(&self) -> u64 {
@@ -122,6 +133,10 @@ impl HistoryFile {
             .iter()
             .map(HistoryEntry::estimated_tokens)
             .sum()
+    }
+
+    pub(crate) fn total_token_usage(&self) -> u64 {
+        self.total_tokens
     }
 
     pub(crate) fn needs_compaction(&self, token_limit: u64) -> bool {
@@ -161,8 +176,9 @@ impl HistoryFile {
         if let Some(user) = resume_user {
             self.push_user(user);
         }
-        self.last_api_input_tokens = None;
-        self.last_accounted_entry_count = self.entries.len();
+        let start = self.last_system_index().unwrap_or(0);
+        let estimated = estimate_entry_tokens(&self.entries, start);
+        apply_estimated_tokens(&mut self.entries, start, estimated.max(1));
     }
 
     fn last_system_index(&self) -> Option<usize> {
@@ -205,6 +221,23 @@ impl HistoryEntry {
                 text_weight(content) + tool_call_weight
             }
             Self::Tool { content, .. } => text_weight(content),
+        }
+    }
+
+    fn reset_estimated_tokens(&mut self) {
+        match self {
+            Self::System {
+                estimated_tokens, ..
+            }
+            | Self::User {
+                estimated_tokens, ..
+            }
+            | Self::Assistant {
+                estimated_tokens, ..
+            }
+            | Self::Tool {
+                estimated_tokens, ..
+            } => *estimated_tokens = 0,
         }
     }
 
@@ -306,6 +339,30 @@ pub(crate) fn token_limit_for_model(model: &str) -> u64 {
     } else {
         DEFAULT_TOKEN_LIMIT
     }
+}
+
+fn apply_estimated_tokens(entries: &mut [HistoryEntry], start: usize, target_total: u64) {
+    if start >= entries.len() {
+        return;
+    }
+
+    for entry in entries.iter_mut() {
+        entry.reset_estimated_tokens();
+    }
+
+    distribute_tokens(&mut entries[start..], target_total);
+}
+
+fn estimate_entry_tokens(entries: &[HistoryEntry], start: usize) -> u64 {
+    if start >= entries.len() {
+        return 0;
+    }
+
+    let weight = entries[start..]
+        .iter()
+        .map(HistoryEntry::weight)
+        .sum::<u64>();
+    weight.saturating_mul(4)
 }
 
 fn distribute_tokens(entries: &mut [HistoryEntry], delta: u64) {

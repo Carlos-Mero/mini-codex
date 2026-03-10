@@ -19,7 +19,8 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use ui::{
     COLOR_BLUE, COLOR_BOLD, COLOR_CYAN, COLOR_DIM, COLOR_GREEN, COLOR_RED, COLOR_YELLOW,
-    editor_prompt, print_tool_call, print_tool_result, prompt_for_approval, role_prefix, style,
+    editor_prompt, print_statusline, print_tool_call, print_tool_result, prompt_for_approval,
+    role_prefix, style,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -214,6 +215,7 @@ impl App {
             rustyline::DefaultEditor::new().context("failed to initialize line editor")?;
 
         loop {
+            self.print_statusline();
             let line = match editor.readline(&editor_prompt("you")) {
                 Ok(line) => line,
                 Err(rustyline::error::ReadlineError::Interrupted) => {
@@ -272,7 +274,11 @@ impl App {
             self.compact_history_if_needed(CompactionMode::MidTurn)?;
             let messages = build_messages(&self.config.workspace_root, &self.history.entries);
             let reply = call_model(&self.client, &self.config.llm, messages, true)?;
-            self.history.note_api_input_tokens(reply.input_tokens);
+            self.history.note_api_usage(
+                reply.input_tokens,
+                reply.output_tokens,
+                reply.total_tokens,
+            );
             let assistant_tool_calls = reply
                 .tool_calls
                 .iter()
@@ -324,7 +330,8 @@ impl App {
         self.history.push_user(self.history.compaction_prompt(mode));
         let messages = build_messages(&self.config.workspace_root, &self.history.entries);
         let reply = call_model(&self.client, &self.config.llm, messages, false)?;
-        self.history.note_api_input_tokens(reply.input_tokens);
+        self.history
+            .note_api_usage(reply.input_tokens, reply.output_tokens, reply.total_tokens);
         self.history.apply_compaction(reply.content, resume_user);
         self.save_history()
     }
@@ -442,6 +449,16 @@ impl App {
         }
     }
 
+    fn print_statusline(&self) {
+        print_statusline(
+            &self.config.workspace_root,
+            &self.config.llm.model,
+            self.history.active_token_usage(),
+            self.config.history_token_limit,
+            self.history.total_token_usage(),
+        );
+    }
+
     fn save_history(&mut self) -> Result<()> {
         self.history.last_active_at_ms = now_millis();
         let text =
@@ -545,8 +562,9 @@ fn load_or_create_session(
                 session_id: format!("session-{}-{}", now_millis(), std::process::id()),
                 workspace_root: workspace_root.display().to_string(),
                 last_active_at_ms: now_millis(),
-                last_api_input_tokens: None,
-                last_accounted_entry_count: 0,
+                total_input_tokens: 0,
+                total_output_tokens: 0,
+                total_tokens: 0,
                 entries: Vec::new(),
             };
             Ok((

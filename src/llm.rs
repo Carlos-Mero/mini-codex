@@ -21,6 +21,8 @@ pub(crate) struct LlmReply {
     pub(crate) content: String,
     pub(crate) tool_calls: Vec<ToolCall>,
     pub(crate) input_tokens: Option<u64>,
+    pub(crate) output_tokens: Option<u64>,
+    pub(crate) total_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +63,8 @@ pub(crate) fn call_model(
                 content,
                 tool_calls,
                 input_tokens: extract_input_tokens(&payload),
+                output_tokens: extract_output_tokens(&payload),
+                total_tokens: extract_total_tokens(&payload),
             })
         })();
         spinner.stop();
@@ -282,6 +286,24 @@ fn extract_input_tokens(payload: &Value) -> Option<u64> {
                 .get("input_tokens")
                 .or_else(|| usage.get("prompt_tokens"))
         })
+        .and_then(Value::as_u64)
+}
+
+fn extract_output_tokens(payload: &Value) -> Option<u64> {
+    payload
+        .get("usage")
+        .and_then(|usage| {
+            usage
+                .get("output_tokens")
+                .or_else(|| usage.get("completion_tokens"))
+        })
+        .and_then(Value::as_u64)
+}
+
+fn extract_total_tokens(payload: &Value) -> Option<u64> {
+    payload
+        .get("usage")
+        .and_then(|usage| usage.get("total_tokens"))
         .and_then(Value::as_u64)
 }
 

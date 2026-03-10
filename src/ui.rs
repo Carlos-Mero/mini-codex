@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::io::{self, Write};
+use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -30,6 +31,31 @@ pub fn editor_prompt(label: &str) -> String {
 
 pub fn role_prefix(label: &str, color: &str) -> String {
     format!("{}  ", style(color, &format!("{label}>")))
+}
+
+pub fn print_statusline(
+    workspace_root: &Path,
+    model: &str,
+    active_tokens: u64,
+    total_context_tokens: u64,
+    cumulative_tokens: u64,
+) {
+    let workspace = shorten_path(workspace_root, 36);
+    let context_percent = if total_context_tokens == 0 {
+        0.0
+    } else {
+        (active_tokens as f64 / total_context_tokens as f64) * 100.0
+    };
+    let line = format!(
+        "{}  {}  {}/{} ({:.1}%)  total {}",
+        workspace,
+        model,
+        format_count(active_tokens),
+        format_count(total_context_tokens),
+        context_percent,
+        format_count(cumulative_tokens),
+    );
+    println!("{}", style(COLOR_DIM, &line));
 }
 
 pub fn print_tool_result(content: &str, success: bool) {
@@ -170,4 +196,37 @@ fn fold_lines_for_display(text: &str, max_lines: usize) -> String {
     }
 
     preview
+}
+
+fn format_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::new();
+    for (index, ch) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            out.push('_');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+fn shorten_path(path: &Path, max_chars: usize) -> String {
+    let text = path.display().to_string();
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text;
+    }
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+    let tail_len = max_chars.saturating_sub(1);
+    let tail = text
+        .chars()
+        .rev()
+        .take(tail_len)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    format!("…{}", tail)
 }
