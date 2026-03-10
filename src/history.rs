@@ -69,34 +69,42 @@ pub(crate) enum CompactionMode {
 
 impl HistoryFile {
     pub(crate) fn push_user(&mut self, content: String) {
-        self.entries.push(HistoryEntry::User {
+        let mut entry = HistoryEntry::User {
             content,
             estimated_tokens: 0,
-        });
+        };
+        entry.set_estimated_tokens(entry.weight().saturating_mul(4));
+        self.entries.push(entry);
     }
 
     pub(crate) fn push_assistant(&mut self, content: String, tool_calls: Vec<AssistantToolCall>) {
-        self.entries.push(HistoryEntry::Assistant {
+        let mut entry = HistoryEntry::Assistant {
             content,
             tool_calls,
             estimated_tokens: 0,
-        });
+        };
+        entry.set_estimated_tokens(entry.weight().saturating_mul(4));
+        self.entries.push(entry);
     }
 
     pub(crate) fn push_tool(&mut self, tool_call_id: String, tool_name: String, content: String) {
-        self.entries.push(HistoryEntry::Tool {
+        let mut entry = HistoryEntry::Tool {
             tool_call_id,
             tool_name,
             content,
             estimated_tokens: 0,
-        });
+        };
+        entry.set_estimated_tokens(entry.weight().saturating_mul(4));
+        self.entries.push(entry);
     }
 
     pub(crate) fn push_system(&mut self, content: String) {
-        self.entries.push(HistoryEntry::System {
+        let mut entry = HistoryEntry::System {
             content,
             estimated_tokens: 0,
-        });
+        };
+        entry.set_estimated_tokens(entry.weight().saturating_mul(4));
+        self.entries.push(entry);
     }
 
     pub(crate) fn note_api_usage(
@@ -221,6 +229,23 @@ impl HistoryEntry {
                 text_weight(content) + tool_call_weight
             }
             Self::Tool { content, .. } => text_weight(content),
+        }
+    }
+
+    fn set_estimated_tokens(&mut self, value: u64) {
+        match self {
+            Self::System {
+                estimated_tokens, ..
+            }
+            | Self::User {
+                estimated_tokens, ..
+            }
+            | Self::Assistant {
+                estimated_tokens, ..
+            }
+            | Self::Tool {
+                estimated_tokens, ..
+            } => *estimated_tokens = value,
         }
     }
 
