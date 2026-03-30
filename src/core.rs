@@ -387,7 +387,8 @@ impl App {
             });
         }
 
-        let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        // let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let shell = "/bin/bash".to_string();
         let output = Command::new(&shell)
             .arg("-lc")
             .arg(&request.command)
