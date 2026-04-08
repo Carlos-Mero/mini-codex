@@ -1,3 +1,4 @@
+use crate::skills::{SkillMetadata, render_skills_section};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::Path;
@@ -284,10 +285,15 @@ impl HistoryEntry {
     }
 }
 
-pub(crate) fn build_messages(workspace_root: &Path, entries: &[HistoryEntry]) -> Vec<Value> {
+pub(crate) fn build_messages(
+    workspace_root: &Path,
+    skills: &[SkillMetadata],
+    enable_shell_tool: bool,
+    entries: &[HistoryEntry],
+) -> Vec<Value> {
     let mut messages = vec![json!({
         "role": "system",
-        "content": system_prompt(workspace_root)
+        "content": system_prompt(workspace_root, skills, enable_shell_tool)
     })];
 
     let active_entries = match entries
@@ -424,8 +430,12 @@ fn text_weight(text: &str) -> u64 {
     text.split_whitespace().count().max(1) as u64
 }
 
-fn system_prompt(workspace_root: &Path) -> String {
-    format!(
+fn system_prompt(
+    workspace_root: &Path,
+    skills: &[SkillMetadata],
+    enable_shell_tool: bool,
+) -> String {
+    let mut prompt = format!(
         concat!(
             "You are Mini Codex, a coding assistant working inside a local workspace.\n",
             "Workspace root: {}.\n",
@@ -444,5 +454,16 @@ fn system_prompt(workspace_root: &Path) -> String {
             "If shell access is not needed, answer normally.\n"
         ),
         workspace_root.display()
-    )
+    );
+
+    if enable_shell_tool {
+        if let Some(skills_section) = render_skills_section(skills) {
+            prompt.push('\n');
+            prompt.push('\n');
+            prompt.push_str(&skills_section);
+            prompt.push('\n');
+        }
+    }
+
+    prompt
 }

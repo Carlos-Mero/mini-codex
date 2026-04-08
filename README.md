@@ -11,6 +11,7 @@ Examples and comparisons with the original OpenAI Codex can be found in [mini-co
 
 - simple CLI chat interface
 - built-in `shell` tool for local workspace tasks
+- Agent Skills discovery from local skill directories
 - `.env` and environment variable support for API configuration
 - manual approval mode or `--auto` for tool execution
 - resumable sessions with `resume` and `resume --last`
@@ -95,8 +96,42 @@ Common examples:
 ```bash
 cargo run -- --reasoning-effort high
 cargo run -- --auto
+cargo run -- --external-skills "/absolute/path/to/skills:/another/skills/root"
 cargo run -- resume
 cargo run -- resume --last
+```
+
+### Skills
+
+When the shell tool is enabled, `mini-codex` scans these directories at startup and adds discovered skills to the system prompt:
+
+1. `<project>/.mini-codex/skills/`
+2. `<project>/.agents/skills/`
+3. `~/.mini-codex/skills/`
+4. `~/.agents/skills/`
+
+You can also add extra roots with `--external-skills`. The value uses the same separator format as `PATH`, so on macOS/Linux you can pass multiple directories with `:`.
+
+Each skill should live in its own directory and include a `SKILL.md` file. `mini-codex` currently implements minimal Agent Skills support:
+
+- it discovers available skills at startup
+- it reads `name` and `description` from the YAML frontmatter at the top of `SKILL.md`
+- it exposes the available skills to the model in the system prompt
+
+Example skill layout:
+
+```text
+.mini-codex/skills/pdf-processing/
+└── SKILL.md
+```
+
+Example `SKILL.md` head:
+
+```md
+---
+name: pdf-processing
+description: Extract PDF text, fill forms, merge files. Use when handling PDFs.
+---
 ```
 
 ### Thinking settings

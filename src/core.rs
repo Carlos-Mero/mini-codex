@@ -1,5 +1,6 @@
 mod history;
 mod llm;
+mod skills;
 mod ui;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -11,6 +12,7 @@ use history::{
 use llm::{LlmConfig, ToolCall, call_model};
 use reqwest::blocking::Client;
 use serde::Deserialize;
+use skills::{SkillMetadata, discover_skills, parse_external_skill_roots};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
@@ -33,6 +35,8 @@ struct Config {
     llm: LlmConfig,
     history_token_limit: u64,
     workspace_root: PathBuf,
+    enable_shell_tool: bool,
+    skills: Vec<SkillMetadata>,
 }
 
 #[derive(Debug)]
@@ -95,6 +99,8 @@ impl App {
         let mut auto_approve = false;
         let mut resume = ResumeMode::New;
         let mut history_token_limit = None;
+        let mut external_skill_roots = Vec::new();
+        let enable_shell_tool = true;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -125,6 +131,12 @@ impl App {
                             .with_context(|| format!("invalid --token-limit value: {value}"))?,
                     );
                 }
+                "--external-skills" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--external-skills requires a value"))?;
+                    external_skill_roots.extend(parse_external_skill_roots(&value));
+                }
                 "resume" => resume = ResumeMode::Select,
                 "--last" => resume = ResumeMode::Last,
                 "--help" | "-h" => {
@@ -141,6 +153,11 @@ impl App {
             .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         let resolved_history_token_limit =
             history_token_limit.unwrap_or_else(|| token_limit_for_model(&model));
+        let skills = if enable_shell_tool {
+            discover_skills(&workspace_root, &external_skill_roots)?
+        } else {
+            Vec::new()
+        };
         let config = Config {
             llm: LlmConfig {
                 api_key,
@@ -151,6 +168,8 @@ impl App {
             },
             history_token_limit: resolved_history_token_limit,
             workspace_root: workspace_root.clone(),
+            enable_shell_tool,
+            skills,
         };
         let (history_path, history) = load_or_create_session(&workspace_root, resume)?;
 
@@ -207,6 +226,11 @@ impl App {
             } else {
                 style(COLOR_CYAN, "ask")
             }
+        );
+        println!(
+            "{} {}",
+            style(COLOR_DIM, "skills loaded:"),
+            self.config.skills.len()
         );
         println!("{} /help", style(COLOR_DIM, "type"));
         self.print_history();
@@ -282,8 +306,18 @@ impl App {
     fn run_agent_loop(&mut self) -> Result<()> {
         for _ in 0..LOOP_LIMIT {
             self.compact_history_if_needed(CompactionMode::MidTurn)?;
-            let messages = build_messages(&self.config.workspace_root, &self.history.entries);
-            let reply = call_model(&self.client, &self.config.llm, messages, true)?;
+            let messages = build_messages(
+                &self.config.workspace_root,
+                &self.config.skills,
+                self.config.enable_shell_tool,
+                &self.history.entries,
+            );
+            let reply = call_model(
+                &self.client,
+                &self.config.llm,
+                messages,
+                self.config.enable_shell_tool,
+            )?;
             self.history.note_api_usage(
                 reply.input_tokens,
                 reply.output_tokens,
@@ -338,7 +372,12 @@ impl App {
             None
         };
         self.history.push_user(self.history.compaction_prompt(mode));
-        let messages = build_messages(&self.config.workspace_root, &self.history.entries);
+        let messages = build_messages(
+            &self.config.workspace_root,
+            &self.config.skills,
+            false,
+            &self.history.entries,
+        );
         let reply = call_model(&self.client, &self.config.llm, messages, false)?;
         self.history
             .note_api_usage(reply.input_tokens, reply.output_tokens, reply.total_tokens);
@@ -745,10 +784,10 @@ fn print_help() {
     println!();
     println!("{}", style(COLOR_DIM, "usage:"));
     println!(
-        "  mini-codex [--model MODEL] [--reasoning-effort LEVEL] [--enable-thinking BOOL] [--token-limit TOKENS] [--auto]"
+        "  mini-codex [--model MODEL] [--reasoning-effort LEVEL] [--enable-thinking BOOL] [--token-limit TOKENS] [--external-skills PATHS] [--auto]"
     );
     println!(
-        "  mini-codex resume [--last] [--model MODEL] [--reasoning-effort LEVEL] [--enable-thinking BOOL] [--token-limit TOKENS] [--auto]"
+        "  mini-codex resume [--last] [--model MODEL] [--reasoning-effort LEVEL] [--enable-thinking BOOL] [--token-limit TOKENS] [--external-skills PATHS] [--auto]"
     );
     println!();
     println!("{}", style(COLOR_DIM, "options:"));
@@ -767,6 +806,10 @@ fn print_help() {
     println!(
         "  {}  Override the session history compaction threshold",
         style(COLOR_DIM, "--token-limit TOKENS")
+    );
+    println!(
+        "  {}  Extra skill roots to scan (same separator format as PATH)",
+        style(COLOR_DIM, "--external-skills PATHS")
     );
     println!(
         "  {}  Auto-approve shell commands instead of asking first",
